@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>文件夹管理器</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" />
+
+<!-- Quick Look preview: syntax highlighting + markdown rendering.
+     Both light/dark variants are always loaded; app.js enables/disables the
+     right pair via link.disabled so they follow the chosen theme (not just
+     the OS setting) — see applyHljsTheme(). -->
+<link id="hljsLight" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" />
+<link id="hljsDark" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+<link id="mdLight" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.5.1/github-markdown-light.min.css" />
+<link id="mdDark" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.5.1/github-markdown-dark.min.css" />
+
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="desktop">
+    <div class="finder-window">
+      <div class="titlebar">
+        <div class="traffic-lights">
+          <span class="dot red"></span>
+          <span class="dot yellow"></span>
+          <span class="dot green"></span>
+        </div>
+        <div class="window-title" id="windowTitle">主目录</div>
+        <button id="btnAppearance" class="nav-btn" title="外观设置"><i class="fa-solid fa-palette"></i></button>
+
+        <div id="appearancePanel" class="appearance-panel hidden">
+          <div class="appearance-section">
+            <div class="appearance-label">主题</div>
+            <div class="theme-options">
+              <button class="theme-option" data-theme-choice="auto" title="跟随系统深浅色">
+                <span class="theme-swatch swatch-auto"></span>跟随系统
+              </button>
+              <button class="theme-option" data-theme-choice="light" title="始终使用亮色">
+                <span class="theme-swatch swatch-light"></span>亮色
+              </button>
+              <button class="theme-option" data-theme-choice="glass" title="毛玻璃效果">
+                <span class="theme-swatch swatch-glass"></span>毛玻璃
+              </button>
+            </div>
+          </div>
+          <div class="appearance-section">
+            <div class="appearance-label">桌面背景</div>
+            <div class="bg-controls">
+              <label for="bgFileInput" class="bg-upload-btn"><i class="fa-solid fa-image"></i>自定义图片</label>
+              <input type="file" id="bgFileInput" accept="image/*" hidden />
+              <button id="btnResetBg" class="nav-btn" title="恢复默认背景"><i class="fa-solid fa-rotate-left"></i></button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <div class="nav-buttons">
+          <button id="btnBack" class="nav-btn" title="后退" disabled><i class="fa-solid fa-chevron-left"></i></button>
+          <button id="btnForward" class="nav-btn" title="前进" disabled><i class="fa-solid fa-chevron-right"></i></button>
+          <button id="btnUp" class="nav-btn" title="上一级"><i class="fa-solid fa-arrow-up"></i></button>
+        </div>
+
+        <div class="breadcrumb" id="breadcrumb"></div>
+
+        <div class="toolbar-spacer"></div>
+
+        <div class="search-box">
+          <i class="fa-solid fa-magnifying-glass"></i>
+          <input type="text" id="searchInput" placeholder="搜索当前文件夹" autocomplete="off" />
+        </div>
+
+        <div class="sort-control">
+          <select id="sortSelect" title="排序方式">
+            <option value="mtime">修改日期</option>
+            <option value="name">名称</option>
+            <option value="size">大小</option>
+          </select>
+          <button id="btnSortDir" class="nav-btn" title="切换排序方向">
+            <i class="fa-solid fa-arrow-down-wide-short"></i>
+          </button>
+        </div>
+
+        <div class="view-toggle">
+          <button id="btnGridView" class="view-btn" title="图标视图"><i class="fa-solid fa-grip"></i></button>
+          <button id="btnListView" class="view-btn" title="列表视图"><i class="fa-solid fa-list"></i></button>
+        </div>
+      </div>
+
+      <div class="body">
+        <aside class="sidebar">
+          <div class="sidebar-section">
+            <div class="sidebar-title">位置</div>
+            <ul id="favList" class="sidebar-list"></ul>
+          </div>
+          <div class="sidebar-section">
+            <div class="sidebar-title">最近修改的项目</div>
+            <ul id="recentList" class="sidebar-list"></ul>
+          </div>
+        </aside>
+
+        <main class="content">
+          <div id="loadingBar" class="loading-bar hidden"><i class="fa-solid fa-circle-notch fa-spin"></i> 加载中…</div>
+          <div id="errorBanner" class="error-banner hidden"></div>
+
+          <div id="gridView" class="grid-view"></div>
+
+          <table id="listView" class="list-view hidden">
+            <thead>
+              <tr>
+                <th class="col-name">名称</th>
+                <th class="col-date">修改日期</th>
+                <th class="col-size">大小</th>
+                <th class="col-kind">类型</th>
+              </tr>
+            </thead>
+            <tbody id="listViewBody"></tbody>
+          </table>
+
+          <div id="emptyState" class="empty-state hidden">
+            <i class="fa-regular fa-folder-open"></i>
+            <p>此文件夹为空</p>
+          </div>
+        </main>
+      </div>
+
+      <div class="statusbar" id="statusbar"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <div id="previewOverlay" class="preview-overlay hidden">
+    <button id="previewPrev" class="preview-side-nav prev" title="上一个 (←)"><i class="fa-solid fa-chevron-left"></i></button>
+    <div class="preview-modal">
+      <div class="preview-header">
+        <div class="preview-file-info">
+          <i id="previewIcon" class="preview-icon"></i>
+          <div class="preview-titles">
+            <div id="previewName" class="preview-name"></div>
+            <div id="previewMeta" class="preview-meta"></div>
+          </div>
+        </div>
+        <div class="preview-actions">
+          <button id="previewCopyPath" class="nav-btn" title="复制路径"><i class="fa-regular fa-copy"></i></button>
+          <button id="previewClose" class="nav-btn" title="关闭 (Esc)"><i class="fa-solid fa-xmark"></i></button>
+        </div>
+      </div>
+      <div id="previewBody" class="preview-body"></div>
+    </div>
+    <button id="previewNext" class="preview-side-nav next" title="下一个 (→)"><i class="fa-solid fa-chevron-right"></i></button>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

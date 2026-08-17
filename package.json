@@ -1,0 +1,13 @@
+{
+  "name": "folder-manager",
+  "version": "1.0.0",
+  "private": true,
+  "description": "本地文件夹管理器 —— Mac Finder 风格的 WSL 主目录浏览器",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}
