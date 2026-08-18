@@ -553,6 +553,48 @@ body {
 }
 .toast.hidden { opacity: 0; pointer-events: none; transform: translateX(-50%) translateY(6px); }
 
+/* Upload */
+.content.drag-over {
+  outline: 3px dashed var(--accent);
+  outline-offset: -6px;
+  background: var(--accent-soft);
+}
+
+.upload-progress {
+  position: fixed;
+  left: 24px;
+  bottom: 24px;
+  width: 240px;
+  background: var(--window-bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  padding: 12px 14px;
+  z-index: 1100;
+}
+.upload-progress.hidden { display: none; }
+.upload-progress-text {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.upload-progress-track {
+  height: 5px;
+  border-radius: 3px;
+  background: var(--hover);
+  overflow: hidden;
+}
+.upload-progress-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width 0.15s ease;
+}
+
 /* Context menu — macOS Finder's right-click menu: compact, frosted panel,
    solid-blue hover highlight (not a light hover wash like typical web
    dropdowns), thin separators, no icons. */

@@ -23,6 +23,7 @@
   - 下载：文件直接下载；文件夹会在服务端实时打包成 zip 再下载（zip 打包是纯 Node 实现，不依赖系统装没装 `zip` 命令）
   - 重命名：原地把名称变成输入框，默认预选“去掉扩展名”的部分，和 Finder/Explorer 的重命名体验一致；只允许改名，不能通过改名把文件“移动”到别的目录
   - 复制路径
+- **上传**：工具栏上传按钮，或者直接把文件从 Windows 资源管理器 / macOS Finder 拖进窗口，松手就会上传到当前打开的文件夹；支持一次多个文件，带进度条，同名文件自动改名成 `文件 (1).ext` 不会覆盖
 - **外观设置**（标题栏调色板图标）
   - 三套主题：跟随系统深浅色（默认）、始终亮色、毛玻璃（半透明磨砂效果）
   - 支持自定义桌面背景图片，本地压缩后保存在浏览器 `localStorage`，无需上传到服务器
@@ -67,6 +68,7 @@ FM_USER=zhuzhu FM_PASS=Zhuzhuzhu23~ ./scripts/start.sh # 增加密码启动
 | `HOST` | 监听地址 | `0.0.0.0` |
 | `FM_ROOT` | 额外强制指定一个根目录（优先级最高，出现在“位置”列表最前面），适合直接指向某个站点/项目目录 | 无 |
 | `FM_USER` / `FM_PASS` | 同时设置后开启登录页鉴权，未设置则不鉴权、直接可用 | 无 |
+| `FM_MAX_UPLOAD_MB` | 单次上传请求体大小上限（MB） | `512` |
 
 ```bash
 PORT=8080 FM_ROOT=/var/www/myapp FM_USER=admin FM_PASS=change-me node server.js
@@ -108,14 +110,14 @@ PORT=8080 FM_ROOT=/var/www/myapp FM_USER=admin FM_PASS=change-me node server.js
 - 默认不鉴权，只适合本机本地访问；一旦部署到服务器或暴露到非回环地址，请配置 `FM_USER`/`FM_PASS`（见上）
 - 登录会话是服务端内存里的随机 token（`crypto.randomBytes(32)`），存在 HttpOnly + SameSite=Strict 的 Cookie 里，JS 读不到、也不会被跨站请求带出去；重启进程会清空所有会话（需要重新登录），这是内存态存储的取舍，换来的是不用额外依赖数据库/文件存 session
 - `/api/login` 按来源 IP 做了失败次数限制（10 分钟内最多 8 次），超过会返回 429
-- 重命名是这个应用目前唯一的写操作：只能改同一目录下的名称（新名称里不允许出现 `/`），没法用它把文件“移动”到别的目录或别的“位置”
+- 写操作目前只有两个：重命名（只能改同一目录下的名称，新名称里不允许出现 `/`，没法用它把文件“移动”到别的目录或别的“位置”）和上传（文件名只取 basename、过滤路径分隔符和控制字符，同名自动改名不会覆盖已有文件，单次请求大小有 `FM_MAX_UPLOAD_MB` 上限防止把磁盘/内存撑爆）
 - **不要**在没有身份验证的情况下把这个服务暴露到公网或不受信任的网络
 
 ## 项目结构
 
 ```
 FolderManager/
-├── server.js          # 零依赖 HTTP 服务：静态资源 + /api/list /api/file /api/raw /api/download /api/rename /api/home /api/stats /api/session /api/login /api/logout
+├── server.js          # 零依赖 HTTP 服务：静态资源 + /api/list /api/file /api/raw /api/download /api/rename /api/upload /api/home /api/stats /api/session /api/login /api/logout
 ├── package.json
 └── public/
     ├── index.html

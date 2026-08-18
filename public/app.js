@@ -90,6 +90,11 @@ const el = {
   loginError: document.getElementById('loginError'),
   loginSubmit: document.getElementById('loginSubmit'),
   btnLogout: document.getElementById('btnLogout'),
+  btnUpload: document.getElementById('btnUpload'),
+  uploadInput: document.getElementById('uploadInput'),
+  uploadProgress: document.getElementById('uploadProgress'),
+  uploadProgressText: document.getElementById('uploadProgressText'),
+  uploadProgressFill: document.getElementById('uploadProgressFill'),
 };
 
 /* ---------------------------------------------------------------------
@@ -1440,6 +1445,103 @@ async function loadStats() {
 }
 
 el.navDashboard.addEventListener('click', showDashboard);
+
+/* ---------------------------------------------------------------------
+ * Upload — toolbar button + drag-and-drop from the OS file manager onto
+ * the content area. Both funnel into the same uploadFiles(); XHR (not
+ * fetch) is used specifically because it's the only one of the two that
+ * exposes upload progress events.
+ * ------------------------------------------------------------------- */
+let uploading = false;
+
+function uploadFiles(fileList) {
+  if (state.view !== 'files') return;
+  const files = Array.from(fileList);
+  if (files.length === 0) return;
+  if (uploading) {
+    showToast('已有上传正在进行，请稍候');
+    return;
+  }
+  uploading = true;
+
+  const form = new FormData();
+  for (const f of files) form.append('file', f, f.name);
+
+  const targetRoot = state.currentRoot;
+  const targetPath = state.currentPath;
+  const url = `/api/upload?root=${encodeURIComponent(targetRoot)}&path=${encodeURIComponent(targetPath)}`;
+
+  el.uploadProgress.classList.remove('hidden');
+  el.uploadProgressText.textContent = `正在上传 ${files.length} 个文件…`;
+  el.uploadProgressFill.style.width = '0%';
+
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', url);
+  xhr.upload.addEventListener('progress', (e) => {
+    if (e.lengthComputable) el.uploadProgressFill.style.width = `${Math.round((e.loaded / e.total) * 100)}%`;
+  });
+  xhr.addEventListener('loadend', () => {
+    uploading = false;
+    el.uploadProgress.classList.add('hidden');
+
+    if (xhr.status === 401) {
+      showLogin();
+      return;
+    }
+    let data = null;
+    try { data = JSON.parse(xhr.responseText); } catch { /* non-JSON error page, fall through to generic message */ }
+
+    if (xhr.status >= 200 && xhr.status < 300 && data) {
+      const okCount = (data.uploaded || []).length;
+      const failCount = (data.failed || []).length;
+      showToast(failCount === 0 ? `已上传 ${okCount} 个文件` : `上传完成：成功 ${okCount} 个，失败 ${failCount} 个`);
+      if (state.currentRoot === targetRoot && state.currentPath === targetPath) {
+        navigate(state.currentPath, { pushHistory: false });
+      }
+    } else {
+      showToast((data && data.error) || `上传失败 (${xhr.status})`);
+    }
+  });
+  xhr.addEventListener('error', () => {
+    uploading = false;
+    el.uploadProgress.classList.add('hidden');
+    showToast('上传失败：网络错误');
+  });
+  xhr.send(form);
+}
+
+el.btnUpload.addEventListener('click', () => el.uploadInput.click());
+el.uploadInput.addEventListener('change', () => {
+  if (el.uploadInput.files.length) uploadFiles(el.uploadInput.files);
+  el.uploadInput.value = ''; // allow re-selecting the same file(s) later
+});
+
+function isFileDrag(e) {
+  return e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files');
+}
+
+let dragDepth = 0;
+el.content.addEventListener('dragenter', (e) => {
+  if (state.view !== 'files' || !isFileDrag(e)) return;
+  e.preventDefault();
+  dragDepth++;
+  el.content.classList.add('drag-over');
+});
+el.content.addEventListener('dragover', (e) => {
+  if (state.view !== 'files' || !isFileDrag(e)) return;
+  e.preventDefault(); // required for drop to fire
+});
+el.content.addEventListener('dragleave', () => {
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0) el.content.classList.remove('drag-over');
+});
+el.content.addEventListener('drop', (e) => {
+  if (state.view !== 'files') return;
+  e.preventDefault();
+  dragDepth = 0;
+  el.content.classList.remove('drag-over');
+  if (e.dataTransfer && e.dataTransfer.files.length) uploadFiles(e.dataTransfer.files);
+});
 
 /* ---------------------------------------------------------------------
  * View / sort controls

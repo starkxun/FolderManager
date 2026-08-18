@@ -90,6 +90,9 @@
           <button id="btnGridView" class="view-btn" title="图标视图"><i class="fa-solid fa-grip"></i></button>
           <button id="btnListView" class="view-btn" title="列表视图"><i class="fa-solid fa-list"></i></button>
         </div>
+
+        <button id="btnUpload" class="nav-btn" title="上传文件"><i class="fa-solid fa-upload"></i></button>
+        <input type="file" id="uploadInput" multiple hidden />
       </div>
 
       <div class="body">
@@ -193,6 +196,11 @@
   </div>
 
   <div id="toast" class="toast hidden"></div>
+
+  <div id="uploadProgress" class="upload-progress hidden">
+    <div class="upload-progress-text" id="uploadProgressText">正在上传…</div>
+    <div class="upload-progress-track"><div class="upload-progress-fill" id="uploadProgressFill"></div></div>
+  </div>
 
   <ul id="contextMenu" class="context-menu hidden"></ul>
 

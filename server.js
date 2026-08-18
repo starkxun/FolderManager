@@ -668,6 +668,179 @@ async function renameEntry(rootId, relPath, newName) {
 }
 
 /* ---------------------------------------------------------------------
+ * Upload — a hand-rolled multipart/form-data parser (again: no external
+ * deps). The whole request body is buffered up to MAX_UPLOAD_BYTES rather
+ * than streamed part-by-part; simpler and correct, and plenty for the
+ * documents/code/images this tool is meant for. Raise FM_MAX_UPLOAD_MB for
+ * bigger files.
+ * ------------------------------------------------------------------- */
+const MAX_UPLOAD_MB = parseInt(process.env.FM_MAX_UPLOAD_MB || '512', 10);
+const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
+
+function tooLargeError() {
+  const err = new Error(`上传内容过大（上限 ${MAX_UPLOAD_MB}MB）`);
+  err.code = 'TOO_LARGE';
+  return err;
+}
+
+// Deliberately never calls req.destroy() on the size-exceeded path: req and
+// res share the same underlying socket, so destroying the request also
+// kills the connection the 413 response needs to go out on. req.pause()
+// just stops us from buffering any more of a body we're going to discard;
+// the route handler closes the connection itself (Connection: close) once
+// the error response is written.
+function readBodyBuffer(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const declaredLength = parseInt(req.headers['content-length'] || '0', 10);
+    if (declaredLength && declaredLength > maxBytes) {
+      reject(tooLargeError());
+      return;
+    }
+    const chunks = [];
+    let size = 0;
+    let settled = false;
+    req.on('data', (chunk) => {
+      if (settled) return;
+      size += chunk.length;
+      if (size > maxBytes) {
+        settled = true;
+        reject(tooLargeError());
+        req.pause();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (!settled) {
+        settled = true;
+        resolve(Buffer.concat(chunks));
+      }
+    });
+    req.on('error', (e) => {
+      if (!settled) {
+        settled = true;
+        reject(e);
+      }
+    });
+  });
+}
+
+function parseMultipartBoundary(contentType) {
+  const match = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(contentType || '');
+  return match ? (match[1] || match[2]).trim() : null;
+}
+
+// Only extracts parts that carry a filename (i.e. actual files) — this app
+// never sends other form fields, so plain fields are ignored.
+function parseMultipartFiles(buffer, boundary) {
+  const delim = Buffer.from(`--${boundary}`);
+  const parts = [];
+  let pos = buffer.indexOf(delim);
+  if (pos === -1) return parts;
+  pos += delim.length;
+
+  while (pos < buffer.length - 1) {
+    if (buffer[pos] === 0x2d && buffer[pos + 1] === 0x2d) break; // "--" => final boundary
+    if (buffer[pos] === 0x0d && buffer[pos + 1] === 0x0a) pos += 2; // CRLF after the boundary marker
+
+    const nextDelim = buffer.indexOf(delim, pos);
+    if (nextDelim === -1) break;
+    let partEnd = nextDelim;
+    if (buffer[partEnd - 2] === 0x0d && buffer[partEnd - 1] === 0x0a) partEnd -= 2; // trailing CRLF before next boundary
+
+    const part = buffer.slice(pos, partEnd);
+    const headerEnd = part.indexOf('\r\n\r\n');
+    if (headerEnd !== -1) {
+      const headerText = part.slice(0, headerEnd).toString('utf8');
+      const filenameMatch = /filename="([^"]*)"/i.exec(headerText);
+      if (filenameMatch && filenameMatch[1]) {
+        parts.push({ filename: filenameMatch[1], data: part.slice(headerEnd + 4) });
+      }
+    }
+
+    pos = nextDelim + delim.length;
+  }
+  return parts;
+}
+
+// Client-supplied filenames are never trusted with their directory
+// component (some browsers include picked-path fragments) — only the
+// basename survives, run through the same character rules as rename.
+function sanitizeUploadName(rawName) {
+  let name = String(rawName || '').replace(/\\/g, '/').split('/').pop().trim();
+  if (!name || name === '.' || name === '..' || INVALID_NAME_RE.test(name)) name = 'upload';
+  if (name.length > 255) name = name.slice(0, 255);
+  return name;
+}
+
+// Finder-style de-duplication on name collision: "photo.png" -> "photo (1).png".
+async function uniqueNameIn(dirAbs, desired) {
+  let candidate = desired;
+  let n = 1;
+  const dot = desired.lastIndexOf('.');
+  const stem = dot > 0 ? desired.slice(0, dot) : desired;
+  const ext = dot > 0 ? desired.slice(dot) : '';
+  while (true) {
+    try {
+      await fsp.stat(path.join(dirAbs, candidate));
+    } catch {
+      return candidate; // ENOENT — free to use
+    }
+    candidate = `${stem} (${n})${ext}`;
+    n++;
+  }
+}
+
+async function handleUpload(req, rootId, relPath) {
+  const targetDir = resolveSafe(rootId, relPath);
+  if (!targetDir) {
+    const err = new Error('该路径超出了当前位置的范围');
+    err.code = 'FORBIDDEN';
+    throw err;
+  }
+  let dirStat;
+  try {
+    dirStat = await fsp.stat(targetDir);
+  } catch (e) {
+    throw wrapFsError(e);
+  }
+  if (!dirStat.isDirectory()) {
+    const err = new Error('目标不是一个文件夹');
+    err.code = 'NOT_DIR';
+    throw err;
+  }
+
+  const boundary = parseMultipartBoundary(req.headers['content-type']);
+  if (!boundary) {
+    const err = new Error('请求格式错误');
+    err.code = 'BAD_REQUEST';
+    throw err;
+  }
+
+  const body = await readBodyBuffer(req, MAX_UPLOAD_BYTES); // TOO_LARGE propagates as-is
+  const files = parseMultipartFiles(body, boundary);
+  if (files.length === 0) {
+    const err = new Error('没有找到要上传的文件');
+    err.code = 'BAD_REQUEST';
+    throw err;
+  }
+
+  const uploaded = [];
+  const failed = [];
+  for (const file of files) {
+    try {
+      const safeName = sanitizeUploadName(file.filename);
+      const finalName = await uniqueNameIn(targetDir, safeName);
+      await fsp.writeFile(path.join(targetDir, finalName), file.data);
+      uploaded.push({ name: finalName, size: file.data.length });
+    } catch (e) {
+      failed.push({ name: file.filename, error: wrapFsError(e, '写入失败').message });
+    }
+  }
+  return { uploaded, failed };
+}
+
+/* ---------------------------------------------------------------------
  * Server usage dashboard
  *
  * CPU% and network throughput are both *rates*, not point-in-time values,
@@ -1006,6 +1179,29 @@ const server = http.createServer(async (req, res) => {
           e.code === 'FORBIDDEN' ? 403 : e.code === 'BAD_NAME' ? 400 : e.code === 'CONFLICT' ? 409 :
           e.code === 'ENOENT' ? 404 : e.code === 'EACCES' ? 403 : 500;
         sendJSON(res, status, { error: e.message || '重命名失败' });
+      }
+      return;
+    }
+
+    if (parsed.pathname === '/api/upload') {
+      if (req.method !== 'POST') {
+        sendJSON(res, 405, { error: 'Method Not Allowed' });
+        return;
+      }
+      const rootId = qp(parsed, 'root', DEFAULT_ROOT_ID);
+      const relPath = qp(parsed, 'path');
+      try {
+        const result = await handleUpload(req, rootId, relPath);
+        sendJSON(res, 200, { ok: true, ...result });
+      } catch (e) {
+        const status =
+          e.code === 'FORBIDDEN' ? 403 : e.code === 'NOT_DIR' ? 400 : e.code === 'BAD_REQUEST' ? 400 :
+          e.code === 'TOO_LARGE' ? 413 : e.code === 'ENOENT' ? 404 : e.code === 'EACCES' ? 403 : 500;
+        // TOO_LARGE means we bailed out with the request body still (partly)
+        // incoming — don't try to keep the connection alive for a next
+        // request, just answer and close.
+        if (e.code === 'TOO_LARGE') res.setHeader('Connection', 'close');
+        sendJSON(res, status, { error: e.message || '上传失败' });
       }
       return;
     }
