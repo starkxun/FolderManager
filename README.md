@@ -40,6 +40,24 @@ node server.js
 
 需要 Node.js 16 及以上版本。
 
+### 后台常驻运行
+
+`scripts/` 下有几个用 `nohup` + PID 文件管理进程的小脚本，关掉终端 / 断开 SSH 都不会中断：
+
+```bash
+./scripts/start.sh    # 启动（已经在跑的话会提示，不会重复启动）
+./scripts/status.sh   # 查看是否在跑、监听在哪个端口
+./scripts/stop.sh     # 停止
+./scripts/restart.sh  # 重启（改完代码 / 换了环境变量后用这个）
+```
+
+日志在 `logs/server.log`（这个目录已经加进 `.gitignore`）。
+
+这几个脚本只保证“终端关闭不影响它”，**不会**在机器重启后自动拉起——如果是在 WSL 里跑，WSL 实例本身也不是持续在线的东西，一般不需要考虑“开机自启”；如果确实需要开机自启，有两个方向：
+
+- 在 WSL 里正儿八经启用 systemd（`/etc/wsl.conf` 加 `[boot]\nsystemd=true`，然后 Windows 侧执行 `wsl --shutdown` 重启 WSL），再用下面「部署到服务器」里给的 systemd unit —— 这也是普通 Linux 服务器上更标准的做法
+- 部署在真正常年开机的服务器上，直接走下面的 systemd 方案
+
 ### 环境变量
 
 | 变量 | 作用 | 默认值 |
