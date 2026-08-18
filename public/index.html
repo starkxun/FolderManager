@@ -4,6 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>文件夹管理器</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📁</text></svg>" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" />
@@ -29,6 +30,7 @@
           <span class="dot green"></span>
         </div>
         <div class="window-title" id="windowTitle">主目录</div>
+        <button id="btnLogout" class="nav-btn hidden" title="退出登录"><i class="fa-solid fa-right-from-bracket"></i></button>
         <button id="btnAppearance" class="nav-btn" title="外观设置"><i class="fa-solid fa-palette"></i></button>
 
         <div id="appearancePanel" class="appearance-panel hidden">
@@ -57,7 +59,7 @@
         </div>
       </div>
 
-      <div class="toolbar">
+      <div class="toolbar" id="toolbar">
         <div class="nav-buttons">
           <button id="btnBack" class="nav-btn" title="后退" disabled><i class="fa-solid fa-chevron-left"></i></button>
           <button id="btnForward" class="nav-btn" title="前进" disabled><i class="fa-solid fa-chevron-right"></i></button>
@@ -94,15 +96,25 @@
         <aside class="sidebar">
           <div class="sidebar-section">
             <div class="sidebar-title">位置</div>
+            <ul id="rootsList" class="sidebar-list"></ul>
+          </div>
+          <div class="sidebar-section" id="favSection">
+            <div class="sidebar-title">收藏</div>
             <ul id="favList" class="sidebar-list"></ul>
           </div>
           <div class="sidebar-section">
             <div class="sidebar-title">最近修改的项目</div>
             <ul id="recentList" class="sidebar-list"></ul>
           </div>
+          <div class="sidebar-section">
+            <div class="sidebar-title">系统</div>
+            <ul class="sidebar-list">
+              <li class="sidebar-item" id="navDashboard" title="服务器状态"><i class="fa-solid fa-gauge-high"></i><span>服务器状态</span></li>
+            </ul>
+          </div>
         </aside>
 
-        <main class="content">
+        <main class="content" id="content">
           <div id="loadingBar" class="loading-bar hidden"><i class="fa-solid fa-circle-notch fa-spin"></i> 加载中…</div>
           <div id="errorBanner" class="error-banner hidden"></div>
 
@@ -124,6 +136,55 @@
             <i class="fa-regular fa-folder-open"></i>
             <p>此文件夹为空</p>
           </div>
+
+          <div id="dashboardView" class="dashboard-view hidden">
+            <div class="dash-header">
+              <div>
+                <div class="dash-hostname" id="dashHostname">—</div>
+                <div class="dash-sub" id="dashPlatform">—</div>
+              </div>
+              <div class="dash-uptime" id="dashUptime">运行时间 --</div>
+            </div>
+
+            <div class="dash-tiles">
+              <div class="dash-tile">
+                <div class="dash-tile-label"><i class="fa-solid fa-microchip"></i> CPU</div>
+                <div class="dash-tile-value" id="tileCpuValue">--%</div>
+                <div class="dash-tile-sub" id="tileCpuSub">-- 核心</div>
+              </div>
+              <div class="dash-tile">
+                <div class="dash-tile-label"><i class="fa-solid fa-memory"></i> 内存</div>
+                <div class="dash-tile-value" id="tileMemValue">--%</div>
+                <div class="dash-tile-sub" id="tileMemSub">-- / --</div>
+              </div>
+              <div class="dash-tile">
+                <div class="dash-tile-label"><i class="fa-solid fa-gauge"></i> 系统负载</div>
+                <div class="dash-tile-value" id="tileLoadValue">--</div>
+                <div class="dash-tile-sub">1 / 5 / 15 分钟</div>
+              </div>
+              <div class="dash-tile">
+                <div class="dash-tile-label"><i class="fa-solid fa-network-wired"></i> 网络</div>
+                <div class="dash-tile-value" id="tileNetValue">--</div>
+                <div class="dash-tile-sub" id="tileNetSub">收 / 发</div>
+              </div>
+            </div>
+
+            <div class="dash-charts">
+              <div class="dash-chart-card">
+                <div class="dash-chart-title">CPU / 内存 使用率</div>
+                <div class="dash-chart-wrap"><canvas id="chartCpuMem"></canvas></div>
+              </div>
+              <div class="dash-chart-card" id="netChartCard">
+                <div class="dash-chart-title">网络吞吐</div>
+                <div class="dash-chart-wrap"><canvas id="chartNet"></canvas></div>
+              </div>
+            </div>
+
+            <div class="dash-disks">
+              <div class="dash-chart-title">磁盘使用</div>
+              <div id="diskList" class="disk-list"></div>
+            </div>
+          </div>
         </main>
       </div>
 
@@ -132,6 +193,20 @@
   </div>
 
   <div id="toast" class="toast hidden"></div>
+
+  <ul id="contextMenu" class="context-menu hidden"></ul>
+
+  <div id="loginOverlay" class="login-overlay hidden">
+    <form id="loginForm" class="login-card">
+      <div class="login-icon"><i class="fa-solid fa-lock"></i></div>
+      <div class="login-title">需要登录</div>
+      <div class="login-sub">此 FolderManager 实例已启用身份验证</div>
+      <input type="text" id="loginUsername" class="login-input" placeholder="用户名" autocomplete="username" required />
+      <input type="password" id="loginPassword" class="login-input" placeholder="密码" autocomplete="current-password" required />
+      <div id="loginError" class="login-error hidden"></div>
+      <button type="submit" id="loginSubmit" class="login-submit">登录</button>
+    </form>
+  </div>
 
   <div id="previewOverlay" class="preview-overlay hidden">
     <button id="previewPrev" class="preview-side-nav prev" title="上一个 (←)"><i class="fa-solid fa-chevron-left"></i></button>
@@ -157,6 +232,7 @@
   <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.0/chart.umd.min.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

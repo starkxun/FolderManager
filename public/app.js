@@ -4,16 +4,22 @@
  * State
  * ------------------------------------------------------------------- */
 const state = {
-  currentPath: '',              // relative to home root, '' = root
+  currentPath: '',              // relative to the active root, '' = root
+  currentRoot: null,            // id of the active root, e.g. 'home', 'var-www'
+  roots: [],                    // [{id, label, icon}] — auto-detected at startup, see /api/home
   entries: [],                  // raw entries for currentPath
-  history: [],                  // navigation stack of paths
+  history: [],                  // navigation stack of {root, path}
   historyIndex: -1,
   viewMode: localStorage.getItem('fm_viewMode') || 'grid',
   sortKey: localStorage.getItem('fm_sortKey') || 'mtime',
   sortDir: localStorage.getItem('fm_sortDir') || 'desc',
   selectedName: null,
-  homeLabel: '主目录',
+  view: 'files',                 // 'files' | 'dashboard'
 };
+
+function currentRootInfo() {
+  return state.roots.find((r) => r.id === state.currentRoot) || { id: state.currentRoot, label: '主目录', icon: 'fa-solid fa-house' };
+}
 
 /* ---------------------------------------------------------------------
  * DOM refs
@@ -56,6 +62,34 @@ const el = {
   hljsDark: document.getElementById('hljsDark'),
   mdLight: document.getElementById('mdLight'),
   mdDark: document.getElementById('mdDark'),
+  toolbar: document.getElementById('toolbar'),
+  rootsList: document.getElementById('rootsList'),
+  favSection: document.getElementById('favSection'),
+  navDashboard: document.getElementById('navDashboard'),
+  dashboardView: document.getElementById('dashboardView'),
+  dashHostname: document.getElementById('dashHostname'),
+  dashPlatform: document.getElementById('dashPlatform'),
+  dashUptime: document.getElementById('dashUptime'),
+  tileCpuValue: document.getElementById('tileCpuValue'),
+  tileCpuSub: document.getElementById('tileCpuSub'),
+  tileMemValue: document.getElementById('tileMemValue'),
+  tileMemSub: document.getElementById('tileMemSub'),
+  tileLoadValue: document.getElementById('tileLoadValue'),
+  tileNetValue: document.getElementById('tileNetValue'),
+  tileNetSub: document.getElementById('tileNetSub'),
+  chartCpuMem: document.getElementById('chartCpuMem'),
+  chartNet: document.getElementById('chartNet'),
+  netChartCard: document.getElementById('netChartCard'),
+  diskList: document.getElementById('diskList'),
+  contextMenu: document.getElementById('contextMenu'),
+  content: document.getElementById('content'),
+  loginOverlay: document.getElementById('loginOverlay'),
+  loginForm: document.getElementById('loginForm'),
+  loginUsername: document.getElementById('loginUsername'),
+  loginPassword: document.getElementById('loginPassword'),
+  loginError: document.getElementById('loginError'),
+  loginSubmit: document.getElementById('loginSubmit'),
+  btnLogout: document.getElementById('btnLogout'),
 };
 
 /* ---------------------------------------------------------------------
@@ -186,7 +220,7 @@ function isPreviewCandidate(entry) {
 }
 
 function rawFileUrl(relPath) {
-  return `/api/raw?path=${encodeURIComponent(relPath)}`;
+  return `/api/raw?root=${encodeURIComponent(state.currentRoot)}&path=${encodeURIComponent(relPath)}`;
 }
 
 function joinPath(base, name) {
@@ -256,8 +290,20 @@ function formatAbsolute(ms) {
 /* ---------------------------------------------------------------------
  * API
  * ------------------------------------------------------------------- */
-async function fetchListing(relPath) {
-  const res = await fetch(`/api/list?path=${encodeURIComponent(relPath)}`);
+// A session can expire (or get revoked) while the app is open, not just on
+// initial load. Every data call goes through this so a stray 401 always
+// surfaces the login screen instead of a confusing "无法打开该文件夹" error.
+async function apiFetch(url, opts) {
+  const res = await fetch(url, opts);
+  if (res.status === 401) {
+    showLogin();
+    throw new Error('未登录');
+  }
+  return res;
+}
+
+async function fetchListing(relPath, rootId = state.currentRoot) {
+  const res = await apiFetch(`/api/list?root=${encodeURIComponent(rootId)}&path=${encodeURIComponent(relPath)}`);
   const data = await res.json();
   if (!res.ok) {
     const err = new Error(data.error || `请求失败 (${res.status})`);
@@ -278,48 +324,90 @@ function showToast(msg) {
 }
 
 /* ---------------------------------------------------------------------
+ * Remember where we were, so a page refresh doesn't dump the user back
+ * at the root every time.
+ * ------------------------------------------------------------------- */
+const LAST_LOCATION_KEY = 'fm_last_location';
+
+function saveLastLocation() {
+  try {
+    localStorage.setItem(LAST_LOCATION_KEY, JSON.stringify({ root: state.currentRoot, path: state.currentPath }));
+  } catch {
+    /* localStorage full/unavailable — losing "resume where I left off" isn't worth failing navigation over */
+  }
+}
+
+function loadLastLocation() {
+  try {
+    const raw = localStorage.getItem(LAST_LOCATION_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+/* ---------------------------------------------------------------------
  * Navigation
  * ------------------------------------------------------------------- */
-async function navigate(relPath, { pushHistory = true } = {}) {
+// `silent` skips the error banner and leaves state untouched on failure —
+// used only for the on-load "restore last folder" attempt, where a stale
+// saved path (deleted folder, unmounted drive) should quietly fall back to
+// the root instead of greeting the user with an error the moment the app
+// opens. Returns whether navigation succeeded.
+async function navigate(relPath, { pushHistory = true, root = state.currentRoot, silent = false } = {}) {
+  showFiles();
   el.loadingBar.classList.remove('hidden');
-  el.errorBanner.classList.add('hidden');
+  if (!silent) el.errorBanner.classList.add('hidden');
   try {
-    const data = await fetchListing(relPath);
+    const data = await fetchListing(relPath, root);
+    state.currentRoot = root;
     state.currentPath = data.path;
     state.entries = data.entries;
     state.selectedName = null;
 
     if (pushHistory) {
       state.history = state.history.slice(0, state.historyIndex + 1);
-      state.history.push(state.currentPath);
+      state.history.push({ root: state.currentRoot, path: state.currentPath });
       state.historyIndex = state.history.length - 1;
     }
 
+    saveLastLocation();
     renderAll();
     if (state.currentPath === '') refreshSidebar(); // keep sidebar in sync with fresh mtimes
+    return true;
   } catch (e) {
-    el.errorBanner.textContent = `无法打开该文件夹：${e.message}`;
-    el.errorBanner.classList.remove('hidden');
-    el.gridView.innerHTML = '';
-    el.listViewBody.innerHTML = '';
-    el.emptyState.classList.add('hidden');
+    if (!silent) {
+      el.errorBanner.textContent = `无法打开该文件夹：${e.message}`;
+      el.errorBanner.classList.remove('hidden');
+      el.gridView.innerHTML = '';
+      el.listViewBody.innerHTML = '';
+      el.emptyState.classList.add('hidden');
+    }
+    return false;
   } finally {
     el.loadingBar.classList.add('hidden');
   }
 }
 
+function switchRoot(rootId) {
+  if (rootId === state.currentRoot) { navigate(''); return; }
+  navigate('', { root: rootId });
+}
+
 function goBack() {
   if (state.historyIndex <= 0) return;
   state.historyIndex--;
-  navigate(state.history[state.historyIndex], { pushHistory: false });
+  const entry = state.history[state.historyIndex];
+  navigate(entry.path, { pushHistory: false, root: entry.root });
 }
 function goForward() {
   if (state.historyIndex >= state.history.length - 1) return;
   state.historyIndex++;
-  navigate(state.history[state.historyIndex], { pushHistory: false });
+  const entry = state.history[state.historyIndex];
+  navigate(entry.path, { pushHistory: false, root: entry.root });
 }
 function goUp() {
-  if (!state.currentPath) return;
+  if (state.view !== 'files' || !state.currentPath) return;
   const parts = state.currentPath.split('/');
   parts.pop();
   navigate(parts.join('/'));
@@ -328,8 +416,11 @@ function goUp() {
 /* ---------------------------------------------------------------------
  * Sidebar
  * ------------------------------------------------------------------- */
+// Well-known subfolder names worth surfacing as favorites, checked against
+// whatever root is currently active. Mostly meaningful for a home-directory
+// root (Desktop/Documents/...); for a server root like /var/www these
+// usually just won't match anything, and the whole section hides itself.
 const FAVORITE_CANDIDATES = [
-  { match: null, label: state.homeLabel, icon: 'fa-solid fa-house', path: '' },
   { match: 'desktop', label: '桌面', icon: 'fa-solid fa-desktop' },
   { match: 'documents', label: '文稿', icon: 'fa-solid fa-file-lines' },
   { match: 'downloads', label: '下载', icon: 'fa-solid fa-download' },
@@ -337,22 +428,32 @@ const FAVORITE_CANDIDATES = [
   { match: 'projects', label: '项目', icon: 'fa-solid fa-diagram-project' },
 ];
 
+function renderRootsList() {
+  el.rootsList.innerHTML = '';
+  for (const r of state.roots) {
+    const li = document.createElement('li');
+    li.className = 'sidebar-item';
+    li.dataset.rootId = r.id;
+    li.title = r.label;
+    li.innerHTML = `<i class="${r.icon}"></i><span>${escapeHtml(r.label)}</span>`;
+    li.addEventListener('click', () => switchRoot(r.id));
+    el.rootsList.appendChild(li);
+  }
+}
+
 async function refreshSidebar() {
   try {
     const data = await fetchListing('');
     const dirs = data.entries.filter((e) => e.isDir && !e.error);
     const dirByLower = new Map(dirs.map((d) => [d.name.toLowerCase(), d]));
 
-    // Favorites: home + any well-known folders that actually exist
+    // Favorites: well-known folders that actually exist under the active root
     el.favList.innerHTML = '';
     for (const fav of FAVORITE_CANDIDATES) {
-      if (fav.match === null) {
-        el.favList.appendChild(buildSidebarItem(fav.label, fav.icon, ''));
-        continue;
-      }
       const found = dirByLower.get(fav.match);
       if (found) el.favList.appendChild(buildSidebarItem(fav.label, fav.icon, found.name));
     }
+    el.favSection.classList.toggle('hidden', el.favList.children.length === 0);
 
     // Recent: top-level folders sorted by most recently modified
     const recent = [...dirs].filter((d) => !d.hidden).sort((a, b) => (b.mtimeMs || 0) - (a.mtimeMs || 0)).slice(0, 12);
@@ -384,6 +485,7 @@ function buildSidebarItem(label, icon, targetPath) {
   const li = document.createElement('li');
   li.className = 'sidebar-item';
   li.dataset.path = targetPath;
+  li.dataset.root = state.currentRoot;
   li.title = label;
   li.innerHTML = `<i class="${icon}"></i><span>${escapeHtml(label)}</span>`;
   li.addEventListener('click', () => navigate(targetPath));
@@ -391,9 +493,14 @@ function buildSidebarItem(label, icon, targetPath) {
 }
 
 function highlightSidebar() {
-  document.querySelectorAll('.sidebar-item').forEach((item) => {
-    item.classList.toggle('active', item.dataset.path === state.currentPath);
+  const inFiles = state.view === 'files';
+  document.querySelectorAll('#favList .sidebar-item, #recentList .sidebar-item').forEach((item) => {
+    item.classList.toggle('active', inFiles && item.dataset.path === state.currentPath && item.dataset.root === state.currentRoot);
   });
+  document.querySelectorAll('#rootsList .sidebar-item').forEach((item) => {
+    item.classList.toggle('active', inFiles && item.dataset.rootId === state.currentRoot && state.currentPath === '');
+  });
+  el.navDashboard.classList.toggle('active', state.view === 'dashboard');
 }
 
 /* ---------------------------------------------------------------------
@@ -401,9 +508,10 @@ function highlightSidebar() {
  * ------------------------------------------------------------------- */
 function renderBreadcrumb() {
   el.breadcrumb.innerHTML = '';
+  const root = currentRootInfo();
   const homeCrumb = document.createElement('span');
   homeCrumb.className = 'crumb' + (state.currentPath === '' ? ' current' : '');
-  homeCrumb.innerHTML = `<i class="fa-solid fa-house"></i> ${escapeHtml(state.homeLabel)}`;
+  homeCrumb.innerHTML = `<i class="${root.icon}"></i> ${escapeHtml(root.label)}`;
   homeCrumb.addEventListener('click', () => navigate(''));
   el.breadcrumb.appendChild(homeCrumb);
 
@@ -452,7 +560,7 @@ function getVisibleEntries() {
 function renderAll() {
   renderBreadcrumb();
   highlightSidebar();
-  const folderName = state.currentPath === '' ? state.homeLabel : state.currentPath.split('/').pop();
+  const folderName = state.currentPath === '' ? currentRootInfo().label : state.currentPath.split('/').pop();
   el.windowTitle.textContent = folderName;
 
   const visible = getVisibleEntries();
@@ -550,10 +658,24 @@ function attachEntryEvents(node, entry) {
       openPreview(entry);
     });
   }
+  node.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    if (entry.error) return;
+    selectEntry(entry.name);
+    openContextMenu(e.clientX, e.clientY, entry);
+  });
+}
+
+function nodeForEntry(name) {
+  return document.querySelector(`.tile[data-name="${CSS.escape(name)}"], .list-view tbody tr[data-name="${CSS.escape(name)}"]`);
 }
 
 function copyPathToClipboard(entry) {
-  const text = `~/${joinPath(state.currentPath, entry.name)}`;
+  // For the home root the classic "~/" reads better; the other auto-detected
+  // roots already have their absolute path as their label (see server.js),
+  // so prefixing with that gives a real, unambiguous path either way.
+  const prefix = state.currentRoot === 'home' ? '~' : currentRootInfo().label;
+  const text = `${prefix}/${joinPath(state.currentPath, entry.name)}`;
   if (navigator.clipboard?.writeText) {
     navigator.clipboard.writeText(text).then(
       () => showToast(`已复制路径：${text}`),
@@ -562,6 +684,163 @@ function copyPathToClipboard(entry) {
   } else {
     showToast(text);
   }
+}
+
+/* ---------------------------------------------------------------------
+ * Right-click context menu (download / rename / copy path) — styled and
+ * behaves like Finder's: solid-highlight items, dismiss on outside click
+ * or Escape, no icons.
+ * ------------------------------------------------------------------- */
+let contextMenuItems = [];
+
+function buildContextMenuItems(entry) {
+  const items = [];
+  if (entry.isDir) {
+    items.push({ label: '打开', action: () => navigate(joinPath(state.currentPath, entry.name)) });
+    items.push({ sep: true });
+  } else if (isPreviewCandidate(entry)) {
+    items.push({ label: '快速查看', action: () => openPreview(entry) });
+    items.push({ sep: true });
+  }
+  items.push({ label: entry.isDir ? '下载（压缩为 zip）' : '下载', action: () => downloadEntry(entry) });
+  items.push({ label: '重命名', action: () => startRename(entry) });
+  items.push({ label: '复制路径', action: () => copyPathToClipboard(entry) });
+  return items;
+}
+
+function openContextMenu(x, y, entry) {
+  contextMenuItems = buildContextMenuItems(entry);
+  el.contextMenu.innerHTML = '';
+  contextMenuItems.forEach((item, i) => {
+    if (item.sep) {
+      el.contextMenu.appendChild(Object.assign(document.createElement('li'), { className: 'context-menu-sep' }));
+      return;
+    }
+    const li = document.createElement('li');
+    li.className = 'context-menu-item';
+    li.textContent = item.label;
+    li.dataset.index = String(i);
+    el.contextMenu.appendChild(li);
+  });
+
+  el.contextMenu.classList.remove('hidden');
+  el.contextMenu.style.left = '0px';
+  el.contextMenu.style.top = '0px';
+  const rect = el.contextMenu.getBoundingClientRect();
+  const maxX = window.innerWidth - rect.width - 8;
+  const maxY = window.innerHeight - rect.height - 8;
+  el.contextMenu.style.left = `${Math.max(8, Math.min(x, maxX))}px`;
+  el.contextMenu.style.top = `${Math.max(8, Math.min(y, maxY))}px`;
+
+  document.addEventListener('mousedown', handleContextMenuOutsideMouseDown, true);
+  document.addEventListener('keydown', handleContextMenuKeydown, true);
+  el.content.addEventListener('scroll', closeContextMenu, { once: true });
+}
+
+function closeContextMenu() {
+  el.contextMenu.classList.add('hidden');
+  el.content.removeEventListener('scroll', closeContextMenu);
+  document.removeEventListener('mousedown', handleContextMenuOutsideMouseDown, true);
+  document.removeEventListener('keydown', handleContextMenuKeydown, true);
+}
+
+function handleContextMenuOutsideMouseDown(e) {
+  if (!el.contextMenu.contains(e.target)) closeContextMenu();
+}
+function handleContextMenuKeydown(e) {
+  if (e.key === 'Escape') closeContextMenu();
+}
+
+el.contextMenu.addEventListener('click', (e) => {
+  const li = e.target.closest('.context-menu-item');
+  if (!li) return;
+  const item = contextMenuItems[Number(li.dataset.index)];
+  closeContextMenu();
+  if (item) item.action();
+});
+
+function downloadEntry(entry) {
+  const relPath = joinPath(state.currentPath, entry.name);
+  const url = `/api/download?root=${encodeURIComponent(state.currentRoot)}&path=${encodeURIComponent(relPath)}`;
+  const a = document.createElement('a');
+  a.href = url;
+  a.rel = 'noopener';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+async function renameOnServer(entry, newName) {
+  try {
+    const res = await apiFetch('/api/rename', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ root: state.currentRoot, path: joinPath(state.currentPath, entry.name), newName }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showToast(data.error || '重命名失败');
+      return false;
+    }
+    state.selectedName = data.newName;
+    await navigate(state.currentPath, { pushHistory: false });
+    return true;
+  } catch {
+    return false; // apiFetch already surfaced a login screen or the error is otherwise unrecoverable here
+  }
+}
+
+// Swaps the on-screen name label for a text input, Finder-style: the
+// "stem" (name minus extension) comes pre-selected so typing immediately
+// replaces just that part, exactly like Finder/Explorer rename.
+function startRename(entry) {
+  const node = nodeForEntry(entry.name);
+  if (!node) return;
+  const labelEl = node.classList.contains('tile') ? node.querySelector('.tile-name') : node.querySelector('.name-text');
+  if (!labelEl) return;
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'rename-input';
+  input.value = entry.name;
+  input.spellcheck = false;
+  labelEl.replaceWith(input);
+  input.focus();
+
+  const dot = entry.name.lastIndexOf('.');
+  if (!entry.isDir && dot > 0) input.setSelectionRange(0, dot);
+  else input.select();
+
+  let settled = false;
+  const restore = () => {
+    if (input.isConnected) input.replaceWith(labelEl);
+  };
+  const cancel = () => {
+    if (settled) return;
+    settled = true;
+    restore();
+  };
+  const commit = async () => {
+    if (settled) return;
+    const newName = input.value.trim();
+    if (!newName || newName === entry.name) {
+      settled = true;
+      restore();
+      return;
+    }
+    settled = true;
+    input.disabled = true;
+    const ok = await renameOnServer(entry, newName);
+    if (!ok) restore(); // success re-renders the whole list, replacing this node anyway
+  };
+
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation(); // don't let global shortcuts (space/backspace) fire while typing
+    if (e.key === 'Enter') { e.preventDefault(); commit(); }
+    else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+  });
+  input.addEventListener('click', (e) => e.stopPropagation());
+  input.addEventListener('blur', commit);
 }
 
 function renderStatusbar(visible) {
@@ -588,7 +867,7 @@ const preview = {
 };
 
 async function fetchFilePreview(relPath) {
-  const res = await fetch(`/api/file?path=${encodeURIComponent(relPath)}`);
+  const res = await apiFetch(`/api/file?root=${encodeURIComponent(state.currentRoot)}&path=${encodeURIComponent(relPath)}`);
   const data = await res.json();
   if (!res.ok) throw new Error(data.error || `请求失败 (${res.status})`);
   return data;
@@ -853,6 +1132,316 @@ function initAppearance() {
 }
 
 /* ---------------------------------------------------------------------
+ * Login
+ *
+ * Only relevant when the server has FM_USER/FM_PASS set — /api/session
+ * tells us that up front. When it's not set, none of this ever shows and
+ * the app behaves exactly like before (zero-friction local use).
+ * ------------------------------------------------------------------- */
+async function checkSession() {
+  try {
+    const res = await fetch('/api/session');
+    return await res.json();
+  } catch {
+    // Can't reach the server at all — showing a login dead-end wouldn't
+    // help either; let the rest of init() surface that failure instead.
+    return { authRequired: false, authenticated: true };
+  }
+}
+
+function showLogin() {
+  stopDashboardPolling();
+  el.loginOverlay.classList.remove('hidden');
+  el.loginError.classList.add('hidden');
+  el.loginPassword.value = '';
+  setTimeout(() => el.loginUsername.focus(), 0);
+}
+
+async function handleLoginSubmit(e) {
+  e.preventDefault();
+  const username = el.loginUsername.value;
+  const password = el.loginPassword.value;
+  el.loginSubmit.disabled = true;
+  el.loginError.classList.add('hidden');
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      // A full reload is simplest and most robust here: it re-runs init()
+      // from scratch with the now-valid session cookie, which naturally
+      // restores the last-visited folder via the usual startup path.
+      location.reload();
+      return;
+    }
+    el.loginError.textContent = data.error || '登录失败';
+    el.loginError.classList.remove('hidden');
+  } catch {
+    el.loginError.textContent = '网络错误，请重试';
+    el.loginError.classList.remove('hidden');
+  } finally {
+    el.loginSubmit.disabled = false;
+  }
+}
+
+async function handleLogout() {
+  try {
+    await fetch('/api/logout', { method: 'POST' });
+  } catch {
+    /* best-effort — reload shows the login screen either way once the cookie is gone or expires */
+  }
+  location.reload();
+}
+
+function initLogin() {
+  el.loginForm.addEventListener('submit', handleLoginSubmit);
+  el.btnLogout.addEventListener('click', handleLogout);
+}
+
+/* ---------------------------------------------------------------------
+ * Server usage dashboard
+ * ------------------------------------------------------------------- */
+const DASH_POLL_MS = 3000;
+let dashTimer = null;
+let cpuMemChart = null;
+let netChart = null;
+
+function showFiles() {
+  if (state.view === 'files') return;
+  state.view = 'files';
+  stopDashboardPolling();
+  el.dashboardView.classList.add('hidden');
+  el.toolbar.classList.remove('hidden');
+  el.statusbar.classList.remove('hidden');
+  renderAll();
+}
+
+function showDashboard() {
+  if (!el.previewOverlay.classList.contains('hidden')) closePreview();
+  state.view = 'dashboard';
+  el.toolbar.classList.add('hidden');
+  el.statusbar.classList.add('hidden');
+  el.gridView.classList.add('hidden');
+  el.listView.classList.add('hidden');
+  el.emptyState.classList.add('hidden');
+  el.errorBanner.classList.add('hidden');
+  el.dashboardView.classList.remove('hidden');
+  el.windowTitle.textContent = '服务器状态';
+  el.btnBack.disabled = true;
+  el.btnForward.disabled = true;
+  highlightSidebar();
+  loadStats();
+  startDashboardPolling();
+}
+
+function startDashboardPolling() {
+  stopDashboardPolling();
+  dashTimer = setInterval(loadStats, DASH_POLL_MS);
+}
+function stopDashboardPolling() {
+  clearInterval(dashTimer);
+  dashTimer = null;
+}
+
+async function fetchStats() {
+  const res = await apiFetch('/api/stats');
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || `请求失败 (${res.status})`);
+  return data;
+}
+
+function formatUptime(sec) {
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  if (d > 0) return `${d} 天 ${h} 小时`;
+  if (h > 0) return `${h} 小时 ${m} 分钟`;
+  return `${m} 分钟`;
+}
+
+function formatRate(bytesPerSec) {
+  return `${formatBytes(bytesPerSec)}/s`;
+}
+
+// Chart.js only reads colors once at creation; theme can change at any
+// time via the appearance panel, so grid/tick colors are recomputed from
+// the live CSS variables on every poll rather than fixed at chart setup.
+function chartThemeColors() {
+  const cs = getComputedStyle(document.documentElement);
+  return {
+    text: cs.getPropertyValue('--text-secondary').trim() || '#6e6e73',
+    grid: cs.getPropertyValue('--border').trim() || '#d9d9de',
+    accent: cs.getPropertyValue('--accent').trim() || '#0a84ff',
+  };
+}
+
+// If the Chart.js CDN request failed (offline, blocked, ad-blocker, ...)
+// `window.Chart` never gets defined. Previously that threw partway through
+// loadStats() and silently aborted before the disk list (which runs after
+// the chart code) ever rendered — so a blocked CDN script took the whole
+// dashboard down without any visible error. Now each piece fails on its own
+// and shows a specific fallback instead.
+let chartLoadFailed = false;
+
+function showChartFallback() {
+  chartLoadFailed = true;
+  const msg = '<div class="dash-chart-fallback"><i class="fa-solid fa-triangle-exclamation"></i>图表库加载失败<br><span>请检查网络是否能访问 cdnjs.cloudflare.com</span></div>';
+  el.chartCpuMem.closest('.dash-chart-wrap').innerHTML = msg;
+  el.chartNet.closest('.dash-chart-wrap').innerHTML = msg;
+}
+
+function ensureCharts() {
+  if (cpuMemChart || chartLoadFailed) return;
+  if (typeof Chart === 'undefined') { showChartFallback(); return; }
+  const c = chartThemeColors();
+  const commonScales = {
+    x: { display: false },
+    y: { min: 0, max: 100, ticks: { color: c.text, font: { size: 10 }, callback: (v) => `${v}%` }, grid: { color: c.grid } },
+  };
+
+  cpuMemChart = new Chart(el.chartCpuMem, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [
+        { label: 'CPU', data: [], borderColor: '#ff9f0a', backgroundColor: 'rgba(255,159,10,0.12)', tension: 0.3, pointRadius: 0, fill: true, borderWidth: 2 },
+        { label: '内存', data: [], borderColor: '#0a84ff', backgroundColor: 'rgba(10,132,255,0.12)', tension: 0.3, pointRadius: 0, fill: true, borderWidth: 2 },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: { legend: { display: true, labels: { color: c.text, boxWidth: 10, font: { size: 11 } } } },
+      scales: commonScales,
+    },
+  });
+
+  netChart = new Chart(el.chartNet, {
+    type: 'line',
+    data: {
+      labels: [],
+      datasets: [
+        { label: '下载', data: [], borderColor: '#30d158', backgroundColor: 'rgba(48,209,88,0.12)', tension: 0.3, pointRadius: 0, fill: true, borderWidth: 2 },
+        { label: '上传', data: [], borderColor: '#bf5af2', backgroundColor: 'rgba(191,90,242,0.12)', tension: 0.3, pointRadius: 0, fill: true, borderWidth: 2 },
+      ],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: { legend: { display: true, labels: { color: c.text, boxWidth: 10, font: { size: 11 } } } },
+      scales: {
+        x: { display: false },
+        y: { min: 0, ticks: { color: c.text, font: { size: 10 }, callback: (v) => formatBytes(v) + '/s' }, grid: { color: c.grid } },
+      },
+    },
+  });
+}
+
+function updateCharts(payload) {
+  ensureCharts();
+  if (!cpuMemChart) return; // Chart.js unavailable — fallback message already shown
+  const c = chartThemeColors();
+  const labels = payload.history.map((h) => new Date(h.t).toLocaleTimeString('zh-CN', { hour12: false }));
+
+  cpuMemChart.data.labels = labels;
+  cpuMemChart.data.datasets[0].data = payload.history.map((h) => h.cpu);
+  cpuMemChart.data.datasets[1].data = payload.history.map((h) => h.mem);
+  cpuMemChart.options.scales.y.ticks.color = c.text;
+  cpuMemChart.options.scales.y.grid.color = c.grid;
+  cpuMemChart.options.plugins.legend.labels.color = c.text;
+  cpuMemChart.update('none');
+
+  const netAvailable = payload.net.available;
+  el.netChartCard.classList.toggle('hidden', !netAvailable);
+  if (netAvailable) {
+    netChart.data.labels = labels;
+    netChart.data.datasets[0].data = payload.history.map((h) => h.net.rxRate);
+    netChart.data.datasets[1].data = payload.history.map((h) => h.net.txRate);
+    netChart.options.scales.y.ticks.color = c.text;
+    netChart.options.scales.y.grid.color = c.grid;
+    netChart.options.plugins.legend.labels.color = c.text;
+    netChart.update('none');
+  }
+}
+
+function diskBarClass(percent) {
+  if (percent >= 90) return 'danger';
+  if (percent >= 75) return 'warning';
+  return '';
+}
+
+function renderDisks(disks) {
+  el.diskList.innerHTML = '';
+  if (disks.length === 0) {
+    el.diskList.innerHTML = '<div class="disk-empty">无法读取磁盘信息</div>';
+    return;
+  }
+  for (const d of disks) {
+    const row = document.createElement('div');
+    row.className = 'disk-row';
+    const pct = Math.min(100, d.percent);
+    row.innerHTML = `
+      <div class="disk-row-top">
+        <span class="disk-mount">${escapeHtml(d.mount)}</span>
+        <span class="disk-meta">${escapeHtml(d.fs)} · ${d.type} · ${formatBytes(d.used)} / ${formatBytes(d.size)}</span>
+      </div>
+      <div class="disk-bar"><div class="disk-bar-fill ${diskBarClass(pct)}" style="width:${pct.toFixed(1)}%"></div></div>
+    `;
+    el.diskList.appendChild(row);
+  }
+}
+
+async function loadStats() {
+  let data;
+  try {
+    data = await fetchStats();
+  } catch (e) {
+    // Keep last-known values on screen rather than blanking the dashboard
+    // over a single flaky poll, but don't swallow the error entirely.
+    console.error('FolderManager: /api/stats 请求失败', e);
+    return;
+  }
+
+  el.dashHostname.textContent = data.hostname;
+  el.dashPlatform.textContent = `${data.platform} · ${data.cpu.model}`;
+  el.dashUptime.textContent = `运行时间 ${formatUptime(data.uptimeSec)}`;
+
+  el.tileCpuValue.textContent = `${data.cpu.percent.toFixed(1)}%`;
+  el.tileCpuSub.textContent = `${data.cpu.cores} 核心`;
+
+  el.tileMemValue.textContent = `${data.mem.percent.toFixed(1)}%`;
+  el.tileMemSub.textContent = `${formatBytes(data.mem.used)} / ${formatBytes(data.mem.total)}`;
+
+  el.tileLoadValue.textContent = data.cpu.loadavg.map((v) => v.toFixed(2)).join(' / ');
+
+  if (data.net.available) {
+    el.tileNetValue.textContent = formatRate(data.net.rxRate);
+    el.tileNetSub.textContent = `↓ ${formatRate(data.net.rxRate)}  ↑ ${formatRate(data.net.txRate)}`;
+  } else {
+    el.tileNetValue.textContent = '不可用';
+    el.tileNetSub.textContent = '当前系统不支持读取';
+  }
+
+  // Each rendered independently — a Chart.js hiccup shouldn't take the disk
+  // list down with it, and vice versa.
+  try {
+    updateCharts(data);
+  } catch (e) {
+    console.error('FolderManager: 图表渲染失败', e);
+  }
+  try {
+    renderDisks(data.disks);
+  } catch (e) {
+    console.error('FolderManager: 磁盘用量渲染失败', e);
+  }
+}
+
+el.navDashboard.addEventListener('click', showDashboard);
+
+/* ---------------------------------------------------------------------
  * View / sort controls
  * ------------------------------------------------------------------- */
 function applyViewMode() {
@@ -899,6 +1488,9 @@ el.searchInput.addEventListener('input', () => {
 });
 
 document.addEventListener('keydown', (e) => {
+  if (!el.loginOverlay.classList.contains('hidden')) return; // let the login form handle its own keys
+  if (!el.contextMenu.classList.contains('hidden')) return; // context menu has its own Escape handling
+
   const typing = document.activeElement === el.searchInput;
   const previewOpen = !el.previewOverlay.classList.contains('hidden');
 
@@ -928,7 +1520,7 @@ document.addEventListener('keydown', (e) => {
   } else if (e.key === 'Backspace' && !typing) {
     e.preventDefault();
     goUp();
-  } else if (e.key === ' ' && !typing) {
+  } else if (e.key === ' ' && !typing && state.view === 'files') {
     const entry = state.entries.find((en) => en.name === state.selectedName);
     if (entry && isPreviewCandidate(entry)) {
       e.preventDefault();
@@ -941,22 +1533,45 @@ document.addEventListener('keydown', (e) => {
 document.getElementById('gridView').addEventListener('click', (e) => {
   if (e.target === el.gridView) selectEntry(null);
 });
+el.gridView.addEventListener('contextmenu', (e) => {
+  if (e.target === el.gridView) e.preventDefault();
+});
+el.listView.addEventListener('contextmenu', (e) => {
+  if (e.target === el.listView || e.target.tagName === 'TBODY') e.preventDefault();
+});
 
 /* ---------------------------------------------------------------------
  * Init
  * ------------------------------------------------------------------- */
+async function completeInit() {
+  try {
+    const info = await apiFetch('/api/home').then((r) => r.json());
+    state.roots = info.roots || [];
+    state.currentRoot = info.defaultRoot || (state.roots[0] && state.roots[0].id) || 'home';
+  } catch {
+    state.roots = [];
+    state.currentRoot = 'home';
+  }
+  renderRootsList();
+  refreshSidebar();
+
+  const saved = loadLastLocation();
+  const savedRootStillExists = saved && state.roots.some((r) => r.id === saved.root);
+  if (savedRootStillExists && (await navigate(saved.path, { root: saved.root, silent: true }))) return;
+  navigate('');
+}
+
 (async function init() {
   applyViewMode();
   applySortDirIcon();
   initAppearance();
-  try {
-    const info = await fetch('/api/home').then((r) => r.json());
-    if (info.home) {
-      const short = info.home.split('/').filter(Boolean).pop();
-      state.homeLabel = short || '主目录';
-      FAVORITE_CANDIDATES[0].label = state.homeLabel;
-    }
-  } catch { /* keep default label */ }
-  refreshSidebar();
-  navigate('');
+  initLogin();
+
+  const session = await checkSession();
+  el.btnLogout.classList.toggle('hidden', !session.authRequired);
+  if (session.authRequired && !session.authenticated) {
+    showLogin();
+    return; // completeInit() runs after a successful login reloads the page
+  }
+  await completeInit();
 })();
