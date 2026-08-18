@@ -46,6 +46,7 @@ node server.js
 
 ```bash
 ./scripts/start.sh    # 启动（已经在跑的话会提示，不会重复启动）
+FM_USER=zhuzhu FM_PASS=Zhuzhuzhu23~ ./scripts/start.sh # 增加密码启动
 ./scripts/status.sh   # 查看是否在跑、监听在哪个端口
 ./scripts/stop.sh     # 停止
 ./scripts/restart.sh  # 重启（改完代码 / 换了环境变量后用这个）
