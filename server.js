@@ -668,14 +668,18 @@ async function renameEntry(rootId, relPath, newName) {
 }
 
 /* ---------------------------------------------------------------------
- * Upload — a hand-rolled multipart/form-data parser (again: no external
- * deps). The whole request body is buffered up to MAX_UPLOAD_BYTES rather
- * than streamed part-by-part; simpler and correct, and plenty for the
- * documents/code/images this tool is meant for. Raise FM_MAX_UPLOAD_MB for
- * bigger files.
+ * Upload — a hand-rolled *streaming* multipart/form-data parser (no
+ * external deps). File data is written to disk as it arrives; at no point
+ * does the server hold a whole upload (or even a whole file) in memory —
+ * only a small rolling buffer bounded by the boundary marker's length.
+ * This matters: an earlier version buffered the entire request before
+ * parsing it, which was fine on a beefy dev machine but could push a
+ * memory-constrained VPS into swapping on a single big upload, dragging
+ * the whole box (even unrelated SSH sessions) to a crawl.
  * ------------------------------------------------------------------- */
 const MAX_UPLOAD_MB = parseInt(process.env.FM_MAX_UPLOAD_MB || '512', 10);
 const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
+const MAX_PART_HEADER_BYTES = 16 * 1024; // generous for Content-Disposition/Content-Type — never legitimately this big
 
 function tooLargeError() {
   const err = new Error(`上传内容过大（上限 ${MAX_UPLOAD_MB}MB）`);
@@ -683,84 +687,9 @@ function tooLargeError() {
   return err;
 }
 
-// Deliberately never calls req.destroy() on the size-exceeded path: req and
-// res share the same underlying socket, so destroying the request also
-// kills the connection the 413 response needs to go out on. req.pause()
-// just stops us from buffering any more of a body we're going to discard;
-// the route handler closes the connection itself (Connection: close) once
-// the error response is written.
-function readBodyBuffer(req, maxBytes) {
-  return new Promise((resolve, reject) => {
-    const declaredLength = parseInt(req.headers['content-length'] || '0', 10);
-    if (declaredLength && declaredLength > maxBytes) {
-      reject(tooLargeError());
-      return;
-    }
-    const chunks = [];
-    let size = 0;
-    let settled = false;
-    req.on('data', (chunk) => {
-      if (settled) return;
-      size += chunk.length;
-      if (size > maxBytes) {
-        settled = true;
-        reject(tooLargeError());
-        req.pause();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on('end', () => {
-      if (!settled) {
-        settled = true;
-        resolve(Buffer.concat(chunks));
-      }
-    });
-    req.on('error', (e) => {
-      if (!settled) {
-        settled = true;
-        reject(e);
-      }
-    });
-  });
-}
-
 function parseMultipartBoundary(contentType) {
   const match = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(contentType || '');
   return match ? (match[1] || match[2]).trim() : null;
-}
-
-// Only extracts parts that carry a filename (i.e. actual files) — this app
-// never sends other form fields, so plain fields are ignored.
-function parseMultipartFiles(buffer, boundary) {
-  const delim = Buffer.from(`--${boundary}`);
-  const parts = [];
-  let pos = buffer.indexOf(delim);
-  if (pos === -1) return parts;
-  pos += delim.length;
-
-  while (pos < buffer.length - 1) {
-    if (buffer[pos] === 0x2d && buffer[pos + 1] === 0x2d) break; // "--" => final boundary
-    if (buffer[pos] === 0x0d && buffer[pos + 1] === 0x0a) pos += 2; // CRLF after the boundary marker
-
-    const nextDelim = buffer.indexOf(delim, pos);
-    if (nextDelim === -1) break;
-    let partEnd = nextDelim;
-    if (buffer[partEnd - 2] === 0x0d && buffer[partEnd - 1] === 0x0a) partEnd -= 2; // trailing CRLF before next boundary
-
-    const part = buffer.slice(pos, partEnd);
-    const headerEnd = part.indexOf('\r\n\r\n');
-    if (headerEnd !== -1) {
-      const headerText = part.slice(0, headerEnd).toString('utf8');
-      const filenameMatch = /filename="([^"]*)"/i.exec(headerText);
-      if (filenameMatch && filenameMatch[1]) {
-        parts.push({ filename: filenameMatch[1], data: part.slice(headerEnd + 4) });
-      }
-    }
-
-    pos = nextDelim + delim.length;
-  }
-  return parts;
 }
 
 // Client-supplied filenames are never trusted with their directory
@@ -791,6 +720,155 @@ async function uniqueNameIn(dirAbs, desired) {
   }
 }
 
+function writeToStream(stream, buf) {
+  return new Promise((resolve, reject) => {
+    if (buf.length === 0 || stream.write(buf)) resolve();
+    else stream.once('drain', resolve);
+    stream.once('error', reject);
+  });
+}
+function endStream(stream) {
+  return new Promise((resolve) => stream.end(resolve));
+}
+
+// Streams a multipart/form-data request body straight into files under
+// targetDir. Keeps only a small "pending" buffer in memory at any time —
+// bounded by the boundary length plus a few bytes, regardless of how large
+// the files being uploaded are.
+async function streamMultipartToDir(req, boundary, targetDir, maxBytes) {
+  const delim = Buffer.from(`--${boundary}`);
+  const CRLF = Buffer.from('\r\n');
+  const CRLFCRLF = Buffer.from('\r\n\r\n');
+
+  let pending = Buffer.alloc(0);
+  let state = 'PREAMBLE'; // PREAMBLE -> AFTER_DELIM -> HEADERS -> BODY -> DONE
+  let current = null; // { finalName, size, stream }
+  let totalBytes = 0;
+  const uploaded = [];
+  const failed = [];
+
+  async function abortCurrent() {
+    if (!current) return;
+    current.stream.destroy();
+    try {
+      await fsp.unlink(current.path);
+    } catch {
+      /* never existed or already gone — fine */
+    }
+    current = null;
+  }
+
+  async function finishCurrent() {
+    if (!current) return;
+    await endStream(current.stream);
+    uploaded.push({ name: current.finalName, size: current.size });
+    current = null;
+  }
+
+  async function startPart(headerText) {
+    const filenameMatch = /filename="([^"]*)"/i.exec(headerText);
+    if (!filenameMatch || !filenameMatch[1]) return; // a non-file field — nothing to stream to
+    const rawName = filenameMatch[1];
+    try {
+      const safeName = sanitizeUploadName(rawName);
+      const finalName = await uniqueNameIn(targetDir, safeName);
+      const dest = path.join(targetDir, finalName);
+      current = { finalName, path: dest, size: 0, stream: fs.createWriteStream(dest) };
+    } catch (e) {
+      failed.push({ name: rawName, error: wrapFsError(e, '写入失败').message });
+    }
+  }
+
+  const declaredLength = parseInt(req.headers['content-length'] || '0', 10);
+  if (declaredLength && declaredLength > maxBytes) throw tooLargeError();
+
+  try {
+    for await (const chunk of req) {
+      totalBytes += chunk.length;
+      if (totalBytes > maxBytes) throw tooLargeError(); // cleanup happens once, in the catch below
+      pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+
+      let progressed = true;
+      while (progressed) {
+        progressed = false;
+
+        if (state === 'PREAMBLE') {
+          const idx = pending.indexOf(delim);
+          if (idx === -1) {
+            if (pending.length > delim.length) pending = pending.slice(pending.length - delim.length + 1);
+            break;
+          }
+          pending = pending.slice(idx + delim.length);
+          state = 'AFTER_DELIM';
+          progressed = true;
+        } else if (state === 'AFTER_DELIM') {
+          if (pending.length < 2) break;
+          if (pending[0] === 0x2d && pending[1] === 0x2d) {
+            state = 'DONE';
+            pending = Buffer.alloc(0);
+            break;
+          }
+          if (pending[0] === 0x0d && pending[1] === 0x0a) pending = pending.slice(2);
+          state = 'HEADERS';
+          progressed = true;
+        } else if (state === 'HEADERS') {
+          const idx = pending.indexOf(CRLFCRLF);
+          if (idx === -1) {
+            if (pending.length > MAX_PART_HEADER_BYTES) {
+              const err = new Error('请求格式错误');
+              err.code = 'BAD_REQUEST';
+              throw err;
+            }
+            break;
+          }
+          const headerText = pending.slice(0, idx).toString('utf8');
+          pending = pending.slice(idx + CRLFCRLF.length);
+          await startPart(headerText);
+          state = 'BODY';
+          progressed = true;
+        } else if (state === 'BODY') {
+          const idx = pending.indexOf(delim);
+          if (idx !== -1) {
+            let dataEnd = idx;
+            if (dataEnd >= 2 && pending[dataEnd - 2] === 0x0d && pending[dataEnd - 1] === 0x0a) dataEnd -= CRLF.length;
+            if (current && dataEnd > 0) {
+              const piece = pending.slice(0, dataEnd);
+              current.size += piece.length;
+              await writeToStream(current.stream, piece);
+            }
+            await finishCurrent();
+            pending = pending.slice(idx + delim.length);
+            state = 'AFTER_DELIM';
+            progressed = true;
+          } else {
+            // No boundary in what we have yet — flush everything except a
+            // safety tail long enough to still catch a boundary that spans
+            // this chunk and the next one.
+            const safeLen = Math.max(0, pending.length - (delim.length + CRLF.length));
+            if (safeLen > 0) {
+              const piece = pending.slice(0, safeLen);
+              if (current) {
+                current.size += piece.length;
+                await writeToStream(current.stream, piece);
+              }
+              pending = pending.slice(safeLen);
+            }
+            break;
+          }
+        } else {
+          break; // DONE
+        }
+      }
+    }
+  } catch (e) {
+    await abortCurrent();
+    throw e;
+  }
+
+  await abortCurrent(); // stray unterminated part, if the body ended mid-file — discard it, don't leave a truncated file behind
+  return { uploaded, failed };
+}
+
 async function handleUpload(req, rootId, relPath) {
   const targetDir = resolveSafe(rootId, relPath);
   if (!targetDir) {
@@ -817,27 +895,13 @@ async function handleUpload(req, rootId, relPath) {
     throw err;
   }
 
-  const body = await readBodyBuffer(req, MAX_UPLOAD_BYTES); // TOO_LARGE propagates as-is
-  const files = parseMultipartFiles(body, boundary);
-  if (files.length === 0) {
+  const result = await streamMultipartToDir(req, boundary, targetDir, MAX_UPLOAD_BYTES);
+  if (result.uploaded.length === 0 && result.failed.length === 0) {
     const err = new Error('没有找到要上传的文件');
     err.code = 'BAD_REQUEST';
     throw err;
   }
-
-  const uploaded = [];
-  const failed = [];
-  for (const file of files) {
-    try {
-      const safeName = sanitizeUploadName(file.filename);
-      const finalName = await uniqueNameIn(targetDir, safeName);
-      await fsp.writeFile(path.join(targetDir, finalName), file.data);
-      uploaded.push({ name: finalName, size: file.data.length });
-    } catch (e) {
-      failed.push({ name: file.filename, error: wrapFsError(e, '写入失败').message });
-    }
-  }
-  return { uploaded, failed };
+  return result;
 }
 
 /* ---------------------------------------------------------------------
@@ -1197,10 +1261,10 @@ const server = http.createServer(async (req, res) => {
         const status =
           e.code === 'FORBIDDEN' ? 403 : e.code === 'NOT_DIR' ? 400 : e.code === 'BAD_REQUEST' ? 400 :
           e.code === 'TOO_LARGE' ? 413 : e.code === 'ENOENT' ? 404 : e.code === 'EACCES' ? 403 : 500;
-        // TOO_LARGE means we bailed out with the request body still (partly)
+        // These mean we bailed out with the request body still (partly)
         // incoming — don't try to keep the connection alive for a next
         // request, just answer and close.
-        if (e.code === 'TOO_LARGE') res.setHeader('Connection', 'close');
+        if (e.code === 'TOO_LARGE' || e.code === 'BAD_REQUEST') res.setHeader('Connection', 'close');
         sendJSON(res, status, { error: e.message || '上传失败' });
       }
       return;
